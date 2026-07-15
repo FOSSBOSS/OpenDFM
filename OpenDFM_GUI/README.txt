@@ -20,7 +20,7 @@ Workflow
 --------
 1. Enter the PLC IP address and remote SD log path.
 2. Choose all dates, last N calendar days, or an inclusive date range.
-3. Click Scan PLC.
+3. Click List Files.
 4. Check the files to retrieve and select the output folder.
 5. Click Download selected.
 
