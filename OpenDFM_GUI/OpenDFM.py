@@ -533,7 +533,7 @@ class OpenDFMDialog(QtWidgets.QDialog):
         text = (
             "1. Enter the PLC IP address and SD log path.\n"
             "2. Choose all dates, the last N calendar days, or an inclusive range.\n"
-            "3. Click Scan PLC, then select the files to download.\n"
+            "3. Click List Files, then select the files to download.\n"
             "4. Choose an output folder and click Download selected.\n\n"
             "Files download one at a time. STOP closes the active connection and "
             "retains the current filename.part file. A later download currently "
