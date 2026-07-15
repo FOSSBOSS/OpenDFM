@@ -1,6 +1,7 @@
 # OpenDFM
 <pre>
-OpenDFM is a utility for pulling remote logs for date formated datalogs from IDEC PLCs. I cant do anything about the transferspeed, but we can improve reliability.
+OpenDFM is a utility for pulling remote logs for date formated datalogs from IDEC PLCs. 
+I cant do anything about the transfer speed, but we can improve reliability.
 <b>Motive:</b>
   I was confused and frustrated by the functionality of other methods.
   <img src="imgs/Confussion.png">
@@ -31,7 +32,11 @@ Found 3 folders and 7 files, 25.8 MiB total.
 /FCDATA01/DATALOG/1-secLog/20260503/20260503_01.csv  5242916 bytes
 /FCDATA01/DATALOG/1-secLog/20260503/20260503_02.csv  2838643 bytes
 
+<b>GUI: A user friendly interface </b>
+<img src="UI_Help.png">
 
+
+More Detail in the OpenDFM_CLI and OpenDFM_GUI folders
 
 <b> </b>
 <b> </b>
