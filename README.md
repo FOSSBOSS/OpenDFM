@@ -33,7 +33,7 @@ Found 3 folders and 7 files, 25.8 MiB total.
 /FCDATA01/DATALOG/1-secLog/20260503/20260503_02.csv  2838643 bytes
 
 <b>GUI: A user friendly interface </b>
-<img src="UI_Help.png">
+<img src="imgs/UI_Help.png">
 
 
 More Detail in the OpenDFM_CLI and OpenDFM_GUI folders
