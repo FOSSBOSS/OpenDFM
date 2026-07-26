@@ -32,6 +32,7 @@ concurrently, while files within each tab transfer sequentially.
 - An inserted and recognized PLC SD card.
 - A valid remote SD-card path.
 
+Tested on Linux, Windows 10 <br>
 On Linux Mint or Ubuntu:
 
 ```bash
