@@ -41,11 +41,15 @@ import socket
 import time
 
 
-VERSION = "2026.07.14.2"
+VERSION = "2026.07.16.2"
 
 
 class SDProtocolError(IOError):
     """The PLC rejected a valid SD-card protocol request."""
+
+
+class SDPathNotFoundError(SDProtocolError):
+    """The requested SD-card directory was not found."""
 
 
 class SDTransportError(IOError):
@@ -286,27 +290,37 @@ class MiSmSDCard:
 
     def listSD(
         self, path: str = "/", retries: Optional[int] = None,
+        cancel: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
-        """List a directory, restarting the complete listing after transient failures."""
+        """List a directory, restarting after transient failures unless cancelled."""
         path = _norm_path(path)
         attempts = self.retries if retries is None else max(int(retries), 1)
 
         for attempt in range(1, attempts + 1):
+            self._raise_if_cancelled(cancel)
             try:
-                return self._list_sd_once(path)
+                return self._list_sd_once(path, cancel)
             except SDProtocolError:
                 raise
             except Exception:
+                self._raise_if_cancelled(cancel)
                 if attempt == attempts:
                     raise
                 self._reset_transport()
-                time.sleep(self.retry_delay)
+                self._cancelable_delay(cancel, self.retry_delay)
 
         raise RuntimeError("unreachable")
 
-    def _list_sd_once(self, path: str) -> List[Dict[str, Any]]:
+    def _list_sd_once(
+        self, path: str, cancel: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
         packet = _frame_bcc(_body_open_dir(self.device, path))
         open_rep = self._request(packet, f"open dir {path}")
+        if open_rep.kind == "ACK_NG" and open_rep.ng_code == "22":
+            raise SDPathNotFoundError(
+                f"Remote SD path does not exist: {path} "
+                "Verify the SD Card is inserted. (PLC code 22)"
+            )
         self._raise_if_bad(open_rep)
 
         try:
@@ -318,6 +332,7 @@ class MiSmSDCard:
 
         entries: List[Dict[str, Any]] = []
         for i in range(count):
+            self._raise_if_cancelled(cancel)
             last = i == count - 1
             body = self.device.encode("ascii") + (b"0FR21" if last else b"1FR20")
             rep = self._request(_frame_no_bcc(body), f"entry {i + 1}/{count}")
@@ -568,6 +583,32 @@ class MiSmSDCard:
                 f"Timed out during SD file transfer: received {len(data)} of {count} bytes"
             )
         return bytes(data)
+
+
+    def _cancel_requested(self, cancel: Optional[Any]) -> bool:
+        if cancel is None:
+            return False
+        is_set = getattr(cancel, "is_set", None)
+        if callable(is_set):
+            return bool(is_set())
+        if callable(cancel):
+            return bool(cancel())
+        return bool(cancel)
+
+    def _raise_if_cancelled(self, cancel: Optional[Any]) -> None:
+        if self._cancel_requested(cancel):
+            raise InterruptedError("SD-card operation was cancelled")
+
+    def _cancelable_delay(self, cancel: Optional[Any], seconds: float) -> None:
+        wait = getattr(cancel, "wait", None)
+        if callable(wait):
+            if wait(max(float(seconds), 0.0)):
+                self._raise_if_cancelled(cancel)
+            return
+        end = time.monotonic() + max(float(seconds), 0.0)
+        while time.monotonic() < end:
+            self._raise_if_cancelled(cancel)
+            time.sleep(min(0.05, end - time.monotonic()))
 
     def _reset_transport(self) -> None:
         """Reset MiSmSerial input state or reconnect a persistent TCP client."""

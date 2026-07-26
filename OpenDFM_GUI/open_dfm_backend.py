@@ -6,16 +6,18 @@ from __future__ import annotations
 import os
 import re
 import time
+from collections import deque
 from datetime import date, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from threading import Event
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from MiSmSDCard import MiSmSDCard
 
 DATE_FOLDER = re.compile(r"^[0-9]{8}$")
 StatusCallback = Optional[Callable[[str], None]]
 ProgressCallback = Optional[Callable[[int, int, float, float], None]]
+FoldersCallback = Optional[Callable[[str, List[str]], None]]
 
 
 class TransferCancelled(Exception):
@@ -68,17 +70,11 @@ def check_cancel(cancel: Optional[Event]) -> None:
 
 
 def resolve_date_range(
-    root_entries: List[Dict[str, Any]], days: Optional[int], start: Optional[date],
+    available: Iterable[date], days: Optional[int], start: Optional[date],
     end: Optional[date],
-) -> Tuple[Optional[date], Optional[date]]:
-    if days is None and start is None and end is None:
-        return None, None
-
-    available = sorted(
-        value for entry in root_entries if entry.get("is_dir")
-        for value in [folder_date(str(entry["name"]))] if value is not None
-    )
-    if not available:
+) -> Tuple[date, date]:
+    dates = sorted(set(available))
+    if not dates:
         raise ValueError("No YYYYMMDD log folders were found below the remote path")
 
     if days is not None:
@@ -86,69 +82,190 @@ def resolve_date_range(
             raise ValueError("Days must be at least 1")
         if start is not None:
             raise ValueError("Last N days cannot be combined with a start date")
-        end = end or available[-1]
+        end = end or dates[-1]
         start = end - timedelta(days=days - 1)
     else:
-        start = start or available[0]
-        end = end or available[-1]
+        start = start or dates[0]
+        end = end or dates[-1]
 
     if start > end:
         raise ValueError("Start date must not be later than end date")
     return start, end
 
 
-def scan_tree(
-    sd: MiSmSDCard, root: str, days: Optional[int] = None,
-    start: Optional[date] = None, end: Optional[date] = None,
-    status: StatusCallback = None, cancel: Optional[Event] = None,
-) -> Tuple[List[str], List[Dict[str, Any]], Optional[date], Optional[date]]:
-    root = "/" + root.strip("/")
+def _list_directory(
+    sd: MiSmSDCard, path: str, status: StatusCallback, cancel: Optional[Event],
+) -> List[Dict[str, Any]]:
     check_cancel(cancel)
     if status:
-        status(f"Listing {root}")
-    root_entries = sd.listSD(root)
-    start, end = resolve_date_range(root_entries, days, start, end)
+        status(f"Listing {path}")
+    try:
+        entries = sd.listSD(path, cancel=cancel)
+    except Exception:
+        check_cancel(cancel)
+        raise
+    check_cancel(cancel)
+    return entries
 
-    dirs = [root]
+
+def _file_entry(entry: Dict[str, Any], full_path: str, selected: bool) -> Dict[str, Any]:
+    item = dict(entry)
+    item["full_path"] = full_path
+    item["default_selected"] = selected
+    return item
+
+
+def _scan_all(
+    sd: MiSmSDCard, root: str, status: StatusCallback, cancel: Optional[Event],
+    folders: FoldersCallback,
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    dirs = {root}
     files: List[Dict[str, Any]] = []
-    pending: List[str] = []
+    pending = deque([root])
 
-    for entry in root_entries:
-        check_cancel(cancel)
-        name = safe_entry_name(entry)
-        full_path = join_remote(root, name)
-        if entry.get("is_dir"):
-            value = folder_date(name)
-            if start is not None and (value is None or not start <= value <= end):
-                continue
-            dirs.append(full_path)
-            pending.append(full_path)
-        elif start is None:
-            item = dict(entry)
-            item["full_path"] = full_path
-            files.append(item)
-
-    pending.sort(reverse=True)
     while pending:
-        check_cancel(cancel)
-        current = pending.pop()
-        if status:
-            status(f"Listing {current}")
-        for entry in sd.listSD(current):
+        current = pending.popleft()
+        child_dirs: List[str] = []
+        for entry in _list_directory(sd, current, status, cancel):
             check_cancel(cancel)
             name = safe_entry_name(entry)
             full_path = join_remote(current, name)
             if entry.get("is_dir"):
-                dirs.append(full_path)
-                pending.append(full_path)
+                if full_path not in dirs:
+                    dirs.add(full_path)
+                    child_dirs.append(full_path)
             else:
-                item = dict(entry)
-                item["full_path"] = full_path
-                files.append(item)
+                files.append(_file_entry(entry, full_path, True))
 
-    dirs.sort()
+        child_dirs.sort()
+        if folders and child_dirs:
+            folders(current, child_dirs)
+        pending.extend(child_dirs)
+
+    return sorted(dirs), sorted(files, key=lambda item: item["full_path"])
+
+
+def _discover_date_folders(
+    sd: MiSmSDCard, root: str, status: StatusCallback, cancel: Optional[Event],
+    folders: FoldersCallback,
+) -> Tuple[set[str], List[Dict[str, Any]], List[Tuple[str, date]]]:
+    """Walk non-date folders breadth-first, stopping at YYYYMMDD folders."""
+    dirs = {root}
+    loose_files: List[Dict[str, Any]] = []
+    date_dirs: List[Tuple[str, date]] = []
+    root_value = folder_date(PurePosixPath(root).name)
+
+    if root_value is not None:
+        date_dirs.append((root, root_value))
+        return dirs, loose_files, date_dirs
+
+    pending = deque([root])
+    while pending:
+        current = pending.popleft()
+        child_dirs: List[str] = []
+        next_dirs: List[str] = []
+        for entry in _list_directory(sd, current, status, cancel):
+            check_cancel(cancel)
+            name = safe_entry_name(entry)
+            full_path = join_remote(current, name)
+            if entry.get("is_dir"):
+                dirs.add(full_path)
+                child_dirs.append(full_path)
+                value = folder_date(name)
+                if value is None:
+                    next_dirs.append(full_path)
+                else:
+                    date_dirs.append((full_path, value))
+            else:
+                loose_files.append(_file_entry(entry, full_path, False))
+
+        child_dirs.sort()
+        next_dirs.sort()
+        if folders and child_dirs:
+            folders(current, child_dirs)
+        pending.extend(next_dirs)
+
+    date_dirs.sort(key=lambda item: item[0])
+    loose_files.sort(key=lambda item: item["full_path"])
+    return dirs, loose_files, date_dirs
+
+
+def _scan_selected_date_folders(
+    sd: MiSmSDCard, selected: Iterable[str], dirs: set[str],
+    status: StatusCallback, cancel: Optional[Event], folders: FoldersCallback,
+) -> List[Dict[str, Any]]:
+    files: List[Dict[str, Any]] = []
+    pending = deque(sorted(selected))
+
+    while pending:
+        current = pending.popleft()
+        child_dirs: List[str] = []
+        for entry in _list_directory(sd, current, status, cancel):
+            check_cancel(cancel)
+            name = safe_entry_name(entry)
+            full_path = join_remote(current, name)
+            if entry.get("is_dir"):
+                if full_path not in dirs:
+                    dirs.add(full_path)
+                    child_dirs.append(full_path)
+            else:
+                files.append(_file_entry(entry, full_path, True))
+
+        child_dirs.sort()
+        if folders and child_dirs:
+            folders(current, child_dirs)
+        pending.extend(child_dirs)
+
     files.sort(key=lambda item: item["full_path"])
-    return dirs, files, start, end
+    return files
+
+
+def scan_tree(
+    sd: MiSmSDCard, root: str, days: Optional[int] = None,
+    start: Optional[date] = None, end: Optional[date] = None,
+    status: StatusCallback = None, cancel: Optional[Event] = None,
+    folders: FoldersCallback = None,
+) -> Tuple[List[str], List[Dict[str, Any]], Optional[date], Optional[date]]:
+    """
+    Scan an SD-card path and optionally filter YYYYMMDD folders at any depth.
+
+    Directories are traversed breadth-first, so all siblings at the current level
+    are listed before OpenDFM descends into older or deeper log folders.
+    """
+    root = "/" + root.strip("/")
+    requested = days is not None or start is not None or end is not None
+    if not requested:
+        dirs, files = _scan_all(sd, root, status, cancel, folders)
+        return dirs, files, None, None
+
+    dirs, loose_files, date_dirs = _discover_date_folders(
+        sd, root, status, cancel, folders,
+    )
+    if not date_dirs:
+        if status:
+            status(
+                "No YYYYMMDD folders were found. Showing the valid directory "
+                "contents without applying the date filter."
+            )
+        return sorted(dirs), loose_files, None, None
+
+    start, end = resolve_date_range(
+        (value for _path, value in date_dirs), days, start, end,
+    )
+    selected = [
+        path for path, value in date_dirs if start <= value <= end
+    ]
+    if status:
+        status(
+            f"Found {len(date_dirs)} date folders; scanning {len(selected)} "
+            f"from {start:%Y%m%d} through {end:%Y%m%d}."
+        )
+
+    files = loose_files + _scan_selected_date_folders(
+        sd, selected, dirs, status, cancel, folders,
+    )
+    files.sort(key=lambda item: item["full_path"])
+    return sorted(dirs), files, start, end
 
 
 def reset_transport(plc: Any) -> None:
@@ -229,7 +346,8 @@ def download_file(
             partial = Path(os.fspath(local) + ".part")
             suffix = ""
             if partial.exists():
-                suffix = f"; partial retained: {partial} ({human_size(partial.stat().st_size)})"
+                size = human_size(partial.stat().st_size)
+                suffix = f"; partial retained: {partial} ({size})"
             if status:
                 status(f"Attempt {attempt}/{attempts} failed: {exc}{suffix}")
             if attempt == attempts:

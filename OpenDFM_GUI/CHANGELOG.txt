@@ -1,0 +1,47 @@
+OpenDFM 2026.07.26.1
+- Clarifying error codes 
+
+
+OpenDFM 2026.07.16.2
+
+- STOP now aborts the active TCP socket with shutdown(), interrupting a blocked
+  directory read immediately instead of waiting for the socket timeout.
+- MiSmTCP will not auto-reconnect after an explicit abort.
+- MiSmSDCard.listSD() accepts an optional cancellation token and will not retry
+  or sleep after cancellation. MiSmSerial and MiSmTCP compatibility is retained.
+- Scan cancellation is checked before, during, and after each directory listing.
+
+OpenDFM changelog
+=================
+
+2026.07.16.1
+------------
+- Directory traversal is now breadth-first instead of depth-first.
+- All folders at one level are listed before descending into child branches.
+- The GUI folder tree updates progressively while Scan PLC is still running.
+- Double-clicking a discovered folder during a scan stops the broad scan and
+  automatically restarts from that folder.
+- Remote paths are normalized to avoid trailing-slash tree duplication.
+- Removed a duplicate download-worker startup call.
+
+2026.07.15.2
+------------
+- Scan PLC now displays a hierarchical folder/file tree.
+- The remote path is treated as a browse root rather than an assumed log root.
+- Double-clicking a folder changes the remote path and rescans it.
+- Date folders may exist below arbitrary intermediate folders such as Alarms or
+  runlogs.
+- Date filtering discovers YYYYMMDD folders at any depth and only descends into
+  dates in range.
+- A valid path with no YYYYMMDD folders is listed instead of raising ValueError.
+- Loose files found while discovering date folders are shown unchecked.
+- ACK/NG code 22 on directory open now reports a clear remote-path error.
+- New tabs default to /FCDATA01/DATALOG and Last 4 days.
+- The command-line downloader now uses the same discovery and filtering backend.
+
+2026.07.15.1
+------------
+- Added independent PLC tabs.
+- Added concurrent transfers to different PLC endpoints.
+- Blocked simultaneous operations against the same IP address and port.
+- Added per-tab settings, progress, logs, STOP controls, and output directories.

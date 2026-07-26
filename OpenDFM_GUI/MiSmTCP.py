@@ -27,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any, Union
 import struct
+import threading
 import time
 import socket
 
@@ -315,6 +316,7 @@ class MiSmTCP:
         self.bcc_mode = bcc_mode
         self.keep_open = keep_open
         self._sock: Optional[socket.socket] = None
+        self._abort_event = threading.Event()
         self.precision = precision
 
         if connect_now and keep_open:
@@ -322,23 +324,57 @@ class MiSmTCP:
 
     def connect(self) -> None:
         """Open the TCP connection if it is not already open."""
+        if self._abort_event.is_set():
+            raise InterruptedError("MiSmTCP operation was aborted")
         if self._sock is not None:
             return
-        self._sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        self._sock.settimeout(self.timeout)
+
+        sock = socket.create_connection(
+            (self.host, self.port), timeout=self.timeout,
+        )
+        sock.settimeout(self.timeout)
+        if self._abort_event.is_set():
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+            raise InterruptedError("MiSmTCP operation was aborted")
+        self._sock = sock
 
     def close(self) -> None:
         """Close the TCP connection."""
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            finally:
-                self._sock = None
+        sock = self._sock
+        self._sock = None
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     disconnect = close
 
+    def abort(self) -> None:
+        """Interrupt an active socket operation without reconnecting."""
+        self._abort_event.set()
+        sock = self._sock
+        self._sock = None
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
     def reconnect(self) -> None:
-        """Force a clean reconnect."""
+        """Force a clean reconnect unless the client was aborted."""
+        if self._abort_event.is_set():
+            raise InterruptedError("MiSmTCP operation was aborted")
         self.close()
         self.connect()
 
@@ -408,17 +444,28 @@ class MiSmTCP:
         """Send one framed request and return one CR-terminated reply."""
         if self.keep_open:
             self.connect()
-            assert self._sock is not None
+            sock = self._sock
+            assert sock is not None
             try:
-                self._sock.sendall(req)
-                return self._recv_until_cr(self._sock)
+                sock.sendall(req)
+                raw = self._recv_until_cr(sock)
+                if self._abort_event.is_set():
+                    raise InterruptedError("MiSmTCP operation was aborted")
+                return raw
+            except InterruptedError:
+                raise
             except (OSError, socket.timeout):
-                # A stale PLC socket is common after cable changes, power cycles, etc.
-                # Reconnect once and retry the same request.
+                if self._abort_event.is_set():
+                    raise InterruptedError("MiSmTCP operation was aborted")
+                # A stale PLC socket is common after cable changes or power cycles.
                 self.reconnect()
-                assert self._sock is not None
-                self._sock.sendall(req)
-                return self._recv_until_cr(self._sock)
+                sock = self._sock
+                assert sock is not None
+                sock.sendall(req)
+                raw = self._recv_until_cr(sock)
+                if self._abort_event.is_set():
+                    raise InterruptedError("MiSmTCP operation was aborted")
+                return raw
 
         with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
             sock.settimeout(self.timeout)

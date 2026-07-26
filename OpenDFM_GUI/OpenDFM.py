@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Qt GUI for downloading IDEC FC6A SD-card logs."""
+"""Tabbed Qt GUI for downloading IDEC FC6A SD-card logs."""
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import sys
 import traceback
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Event
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,11 +24,21 @@ except ImportError as exc:
 from MiSmSDCard import MiSmSDCard
 from MiSmTCP import MiSmTCP
 from open_dfm_backend import (
-    TransferCancelled, download_file, human_size, relative_path, scan_tree,
+    TransferCancelled, download_file, folder_date, human_size, relative_path,
+    scan_tree,
 )
 
-VERSION = "2026.07.14.1"
-DEFAULT_REMOTE = "/FCDATA01/DATALOG/1-secLog"
+VERSION = "2026.07.26.1"
+DEFAULT_REMOTE = "/FCDATA01/DATALOG"
+Endpoint = Tuple[str, int]
+
+
+def endpoint_key(host: str, port: int) -> Endpoint:
+    try:
+        host = str(ipaddress.ip_address(host))
+    except ValueError:
+        host = host.casefold()
+    return host, int(port)
 
 
 @dataclass(frozen=True)
@@ -48,6 +59,7 @@ class DateFilter:
 
 class ScanWorker(QtCore.QObject):
     status = QtCore.pyqtSignal(str)
+    folders = QtCore.pyqtSignal(str, object)
     result = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
     cancelled = QtCore.pyqtSignal()
@@ -75,6 +87,7 @@ class ScanWorker(QtCore.QObject):
                 sd, self.config.remote, days=self.date_filter.days,
                 start=self.date_filter.start, end=self.date_filter.end,
                 status=self.status.emit, cancel=self.stop_event,
+                folders=self.folders.emit,
             )
             self.result.emit({
                 "dirs": dirs, "files": files, "start": start, "end": end,
@@ -82,7 +95,10 @@ class ScanWorker(QtCore.QObject):
         except TransferCancelled:
             self.cancelled.emit()
         except Exception:
-            self.failed.emit(traceback.format_exc())
+            if self.stop_event.is_set():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(traceback.format_exc())
         finally:
             if self.plc is not None:
                 self.plc.close()
@@ -90,7 +106,12 @@ class ScanWorker(QtCore.QObject):
 
     def request_stop(self) -> None:
         self.stop_event.set()
-        if self.plc is not None:
+        if self.plc is None:
+            return
+        abort = getattr(self.plc, "abort", None)
+        if callable(abort):
+            abort()
+        else:
             self.plc.close()
 
 
@@ -183,7 +204,10 @@ class DownloadWorker(QtCore.QObject):
         except TransferCancelled:
             self.cancelled.emit()
         except Exception:
-            self.failed.emit(traceback.format_exc())
+            if self.stop_event.is_set():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(traceback.format_exc())
         finally:
             if self.plc is not None:
                 self.plc.close()
@@ -191,36 +215,88 @@ class DownloadWorker(QtCore.QObject):
 
     def request_stop(self) -> None:
         self.stop_event.set()
-        if self.plc is not None:
+        if self.plc is None:
+            return
+        abort = getattr(self.plc, "abort", None)
+        if callable(abort):
+            abort()
+        else:
             self.plc.close()
 
 
-class OpenDFMDialog(QtWidgets.QDialog):
-    def __init__(self):
+class PLCPage(QtWidgets.QWidget):
+    title_changed = QtCore.pyqtSignal(str)
+    busy_changed = QtCore.pyqtSignal(bool)
+    close_requested = QtCore.pyqtSignal()
+
+    def __init__(
+        self, manager: "OpenDFMWindow", number: int,
+        state: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__()
-        ui_path = Path(__file__).with_name("OpenDFM.ui")
+        ui_path = Path(__file__).with_name("OpenDFMTab.ui")
         uic.loadUi(os.fspath(ui_path), self)
 
-        self.settings = QtCore.QSettings("OpenDFM", "OpenDFM")
+        self.manager = manager
+        self.number = number
         self.thread: Optional[QtCore.QThread] = None
         self.worker: Optional[QtCore.QObject] = None
         self.operation = ""
+        self.active_endpoint: Optional[Endpoint] = None
+        self.close_when_idle = False
         self.scan_signature: Optional[Tuple[Any, ...]] = None
         self.files: List[Dict[str, Any]] = []
         self.file_items: Dict[str, QtWidgets.QTreeWidgetItem] = {}
+        self.live_folder_items: Dict[str, QtWidgets.QTreeWidgetItem] = {}
+        self.live_scan_root = ""
+        self.pending_scan_path: Optional[str] = None
 
-        self.setWindowTitle(f"OpenDFM {VERSION} - PLC SD Log Downloader")
         self.startDateEdit.setDate(QtCore.QDate.currentDate().addDays(-10))
         self.endDateEdit.setDate(QtCore.QDate.currentDate())
-        self.outputEdit.setText(os.fspath(Path.cwd() / "1-secLog"))
         self.mainSplitter.setSizes([610, 490])
         self._configure_tree()
         self._connect_signals()
-        self._restore_settings()
+        self._apply_state(state or self.default_state())
         self._update_date_controls()
         self._update_selection_summary()
+        self._emit_title()
+
+    def default_state(self) -> Dict[str, Any]:
+        host = "192.168.1.61" if self.number == 1 else ""
+        output = Path.cwd() / f"PLC-{self.number}" / "DATALOG"
+        return {
+            "host": host,
+            "port": 2101,
+            "remote": DEFAULT_REMOTE,
+            "output": os.fspath(output),
+            "timeout": 5.0,
+            "retries": 4,
+            "days": 4,
+            "overwrite": False,
+            "date_mode": "days",
+            "start_date": "",
+            "end_date": "",
+        }
+
+    @property
+    def is_busy(self) -> bool:
+        return self.thread is not None
+
+    @property
+    def display_title(self) -> str:
+        host = self.hostEdit.text().strip()
+        return host or f"PLC {self.number}"
+
+    def endpoint(self) -> Endpoint:
+        return self.hostEdit.text().strip(), self.portSpin.value()
+
+    def _emit_title(self, *_args: Any) -> None:
+        self.title_changed.emit(self.display_title)
 
     def _configure_tree(self) -> None:
+        self.fileTree.setRootIsDecorated(True)
+        self.fileTree.setItemsExpandable(True)
+        self.fileTree.headerItem().setText(0, "Remote path")
         header = self.fileTree.header()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
@@ -234,8 +310,10 @@ class OpenDFMDialog(QtWidgets.QDialog):
         self.selectAllButton.clicked.connect(lambda: self.set_all_checked(True))
         self.clearAllButton.clicked.connect(lambda: self.set_all_checked(False))
         self.helpButton.clicked.connect(self.show_help)
-        self.closeButton.clicked.connect(self.close)
+        self.closeButton.clicked.connect(self.close_requested.emit)
         self.fileTree.itemChanged.connect(self._update_selection_summary)
+        self.fileTree.itemDoubleClicked.connect(self._open_folder_item)
+        self.hostEdit.textChanged.connect(self._emit_title)
 
         for radio in (
             self.allDatesRadio, self.lastDaysRadio, self.dateRangeRadio,
@@ -249,8 +327,8 @@ class OpenDFMDialog(QtWidgets.QDialog):
             raise ValueError("IP address is required")
         if not remote:
             raise ValueError("Remote path is required")
-        if not remote.startswith("/"):
-            remote = "/" + remote
+        remote = "/" + remote.strip("/")
+        if remote != self.remoteEdit.text().strip():
             self.remoteEdit.setText(remote)
         return ConnectionConfig(
             host=host, port=self.portSpin.value(),
@@ -291,6 +369,15 @@ class OpenDFMDialog(QtWidgets.QDialog):
         if chosen:
             self.outputEdit.setText(chosen)
 
+    def _claim_endpoint(self, config: ConnectionConfig) -> bool:
+        endpoint = endpoint_key(config.host, config.port)
+        error = self.manager.claim_endpoint(self, endpoint)
+        if error:
+            self._show_error(error)
+            return False
+        self.active_endpoint = endpoint
+        return True
+
     def start_scan(self) -> None:
         if self.thread is not None:
             return
@@ -301,44 +388,120 @@ class OpenDFMDialog(QtWidgets.QDialog):
         except Exception as exc:
             self._show_error(str(exc))
             return
+        if not self._claim_endpoint(config):
+            return
 
         self.fileTree.clear()
         self.files = []
         self.file_items = {}
         self.scan_signature = None
+        self.pending_scan_path = None
+        self.live_scan_root = config.remote
+        self.live_folder_items = {
+            config.remote: self.fileTree.invisibleRootItem(),
+        }
+        self.fileTree.setSortingEnabled(True)
+        self.fileTree.sortItems(0, QtCore.Qt.AscendingOrder)
         self.logEdit.clear()
         self._append_log(f"Connecting to {config.host}:{config.port}")
         self.statusLabel.setText("Scanning PLC...")
 
         worker = ScanWorker(config, date_filter)
         worker.status.connect(self._append_log)
-        worker.result.connect(lambda result: self._scan_complete(result, signature))
+        worker.folders.connect(self._scan_folders_discovered)
+        worker.result.connect(
+            lambda result: self._scan_complete(result, signature)
+        )
         worker.failed.connect(self._worker_error)
         worker.cancelled.connect(self._worker_cancelled)
         self._start_worker(worker, "scan")
+
+    def _scan_folders_discovered(
+        self, parent: str, children: List[str],
+    ) -> None:
+        root_item = self.fileTree.invisibleRootItem()
+        parent_item = self.live_folder_items.get(parent, root_item)
+
+        for remote in sorted(children):
+            if remote in self.live_folder_items:
+                continue
+            path = PurePosixPath(remote)
+            item = QtWidgets.QTreeWidgetItem([path.name + "/", "", "Folder"])
+            item.setData(0, QtCore.Qt.UserRole, {
+                "is_dir": True, "full_path": remote,
+            })
+            item.setToolTip(0, remote)
+            parent_item.addChild(item)
+            self.live_folder_items[remote] = item
+
+        parent_item.setExpanded(True)
+        self.fileTree.sortItems(0, QtCore.Qt.AscendingOrder)
+        count = max(len(self.live_folder_items) - 1, 0)
+        self.statusLabel.setText(f"Scanning PLC... {count} folders found")
 
     def _scan_complete(
         self, result: Dict[str, Any], signature: Tuple[Any, ...],
     ) -> None:
         self.files = list(result["files"])
         self.scan_signature = signature
-        self.fileTree.blockSignals(True)
-        try:
-            for entry in self.files:
-                remote = str(entry["full_path"])
-                item = QtWidgets.QTreeWidgetItem([
-                    remote, human_size(int(entry["size"])), "Ready",
-                ])
-                item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-                item.setCheckState(0, QtCore.Qt.Checked)
-                item.setData(0, QtCore.Qt.UserRole, entry)
-                self.fileTree.addTopLevelItem(item)
-                self.file_items[remote] = item
-        finally:
-            self.fileTree.blockSignals(False)
-
+        self.fileTree.clear()
+        self.live_folder_items = {}
+        root = str(signature[4])
         start = result.get("start")
         end = result.get("end")
+        folder_items: Dict[str, QtWidgets.QTreeWidgetItem] = {}
+
+        self.fileTree.blockSignals(True)
+        self.fileTree.setSortingEnabled(False)
+        try:
+            root_item = self.fileTree.invisibleRootItem()
+            folder_items[root] = root_item
+            dirs = sorted(
+                result["dirs"],
+                key=lambda value: (len(PurePosixPath(value).parts), value),
+            )
+            for remote in dirs:
+                if remote == root:
+                    continue
+                path = PurePosixPath(remote)
+                parent_item = folder_items.get(str(path.parent), root_item)
+                status = "Folder"
+                value = folder_date(path.name)
+                if value is not None:
+                    status = "Date folder"
+                    if start is not None and not start <= value <= end:
+                        status = "Outside date range"
+                item = QtWidgets.QTreeWidgetItem([
+                    path.name + "/", "", status,
+                ])
+                item.setData(0, QtCore.Qt.UserRole, {
+                    "is_dir": True, "full_path": remote,
+                })
+                item.setToolTip(0, remote)
+                parent_item.addChild(item)
+                folder_items[remote] = item
+
+            for entry in self.files:
+                remote = str(entry["full_path"])
+                path = PurePosixPath(remote)
+                parent_item = folder_items.get(str(path.parent), root_item)
+                item = QtWidgets.QTreeWidgetItem([
+                    path.name, human_size(int(entry["size"])), "Ready",
+                ])
+                item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                checked = bool(entry.get("default_selected", True))
+                state = QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked
+                item.setCheckState(0, state)
+                item.setData(0, QtCore.Qt.UserRole, entry)
+                item.setToolTip(0, remote)
+                parent_item.addChild(item)
+                self.file_items[remote] = item
+        finally:
+            self.fileTree.setSortingEnabled(True)
+            self.fileTree.sortItems(0, QtCore.Qt.AscendingOrder)
+            self.fileTree.expandToDepth(1)
+            self.fileTree.blockSignals(False)
+
         if start is not None:
             self._append_log(
                 f"Date range: {start:%Y%m%d} through {end:%Y%m%d}, inclusive"
@@ -349,13 +512,50 @@ class OpenDFMDialog(QtWidgets.QDialog):
             f"Found {folders} folders and {len(self.files)} files, "
             f"{human_size(total)} total."
         )
+        if folders:
+            self._append_log(
+                "Double-click a folder to use it as the remote path and scan it."
+            )
         self.statusLabel.setText("Scan complete.")
         self._update_selection_summary()
 
+    def _tree_file_items(self) -> List[QtWidgets.QTreeWidgetItem]:
+        items: List[QtWidgets.QTreeWidgetItem] = []
+        iterator = QtWidgets.QTreeWidgetItemIterator(self.fileTree)
+        while iterator.value() is not None:
+            item = iterator.value()
+            data = item.data(0, QtCore.Qt.UserRole)
+            if isinstance(data, dict) and not data.get("is_dir"):
+                items.append(item)
+            iterator += 1
+        return items
+
+    def _open_folder_item(
+        self, item: QtWidgets.QTreeWidgetItem, _column: int,
+    ) -> None:
+        data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(data, dict) or not data.get("is_dir"):
+            return
+        remote = str(data["full_path"])
+
+        if self.thread is not None:
+            if self.operation != "scan":
+                return
+            self.pending_scan_path = remote
+            self.remoteEdit.setText(remote)
+            self.scan_signature = None
+            self._append_log(f"Switching scan root to {remote}")
+            self.stop_operation()
+            return
+
+        self.remoteEdit.setText(remote)
+        self.scan_signature = None
+        self.statusLabel.setText(f"Scanning {remote}...")
+        QtCore.QTimer.singleShot(0, self.start_scan)
+
     def selected_files(self) -> List[Dict[str, Any]]:
         selected: List[Dict[str, Any]] = []
-        for index in range(self.fileTree.topLevelItemCount()):
-            item = self.fileTree.topLevelItem(index)
+        for item in self._tree_file_items():
             if item.checkState(0) == QtCore.Qt.Checked:
                 selected.append(item.data(0, QtCore.Qt.UserRole))
         selected.sort(key=lambda entry: str(entry["full_path"]))
@@ -365,8 +565,8 @@ class OpenDFMDialog(QtWidgets.QDialog):
         state = QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked
         self.fileTree.blockSignals(True)
         try:
-            for index in range(self.fileTree.topLevelItemCount()):
-                self.fileTree.topLevelItem(index).setCheckState(0, state)
+            for item in self._tree_file_items():
+                item.setCheckState(0, state)
         finally:
             self.fileTree.blockSignals(False)
         self._update_selection_summary()
@@ -374,12 +574,12 @@ class OpenDFMDialog(QtWidgets.QDialog):
     def _update_selection_summary(self, *_args: Any) -> None:
         selected = self.selected_files()
         total = sum(int(item["size"]) for item in selected)
-        count = self.fileTree.topLevelItemCount()
         self.fileSummaryLabel.setText(
-            f"{len(selected)} / {count} selected, {human_size(total)}"
+            f"{len(selected)} / {len(self.files)} selected, {human_size(total)}"
         )
         self.downloadButton.setEnabled(
-            bool(selected) and self.thread is None and self.scan_signature is not None
+            bool(selected) and self.thread is None
+            and self.scan_signature is not None
         )
 
     def start_download(self) -> None:
@@ -403,6 +603,8 @@ class OpenDFMDialog(QtWidgets.QDialog):
         files = self.selected_files()
         if not files:
             self._show_error("Select at least one file")
+            return
+        if not self._claim_endpoint(config):
             return
 
         self.currentProgressBar.setValue(0)
@@ -439,9 +641,9 @@ class OpenDFMDialog(QtWidgets.QDialog):
     ) -> None:
         value = int(done * 1000 / total) if total else 1000
         self.currentProgressBar.setValue(min(value, 1000))
+        percent = done * 100.0 / total if total else 100.0
         self.currentProgressBar.setFormat(
-            f"{done * 100.0 / total if total else 100.0:.1f}% - "
-            f"{human_size(done)} / {human_size(total)}"
+            f"{percent:.1f}% - {human_size(done)} / {human_size(total)}"
         )
         self.speedLabel.setText(
             f"Current: {human_size(current)}/s    "
@@ -450,7 +652,8 @@ class OpenDFMDialog(QtWidgets.QDialog):
 
     def _file_finished(self, remote: str, state: str) -> None:
         labels = {
-            "downloaded": "Downloaded", "skipped": "Already present",
+            "downloaded": "Downloaded",
+            "skipped": "Already present",
             "failed": "Failed",
         }
         item = self.file_items.get(remote)
@@ -461,7 +664,9 @@ class OpenDFMDialog(QtWidgets.QDialog):
         self.overallProgressBar.setMaximum(max(total, 1))
         self.overallProgressBar.setValue(done)
 
-    def _download_complete(self, downloaded: int, skipped: int, failed: int) -> None:
+    def _download_complete(
+        self, downloaded: int, skipped: int, failed: int,
+    ) -> None:
         self.currentFileLabel.setText("No active transfer")
         self.statusLabel.setText("Download complete.")
         self._append_log(
@@ -469,35 +674,56 @@ class OpenDFMDialog(QtWidgets.QDialog):
         )
 
     def _start_worker(self, worker: QtCore.QObject, operation: str) -> None:
-        thread = QtCore.QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._thread_finished)
+        try:
+            thread = QtCore.QThread(self)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._thread_finished)
 
-        self.thread = thread
-        self.worker = worker
-        self.operation = operation
-        self._set_busy(True)
-        thread.start()
+            self.thread = thread
+            self.worker = worker
+            self.operation = operation
+            self._set_busy(True)
+            thread.start()
+        except Exception:
+            self.manager.release_endpoint(self)
+            self.active_endpoint = None
+            raise
 
     def _thread_finished(self) -> None:
+        restart_path = self.pending_scan_path
+        self.pending_scan_path = None
+        self.manager.release_endpoint(self)
+        self.active_endpoint = None
         self.thread = None
         self.worker = None
         self.operation = ""
         self._set_busy(False)
         self._update_selection_summary()
 
+        if restart_path and not self.close_when_idle:
+            self.statusLabel.setText(f"Scanning {restart_path}...")
+            QtCore.QTimer.singleShot(0, self.start_scan)
+
     def _set_busy(self, busy: bool) -> None:
+        self.connectionGroup.setEnabled(not busy)
+        self.dateGroup.setEnabled(not busy)
+        self.outputEdit.setEnabled(not busy)
+        self.browseButton.setEnabled(not busy)
+        self.overwriteCheck.setEnabled(not busy)
+        self.fileTree.setEnabled(not busy or self.operation == "scan")
+        self.selectAllButton.setEnabled(not busy)
+        self.clearAllButton.setEnabled(not busy)
         self.scanButton.setEnabled(not busy)
         self.stopButton.setEnabled(busy)
-        self.closeButton.setEnabled(not busy)
         self.downloadButton.setEnabled(
             not busy and bool(self.selected_files())
             and self.scan_signature is not None
         )
+        self.busy_changed.emit(busy)
 
     def stop_operation(self) -> None:
         worker = self.worker
@@ -531,85 +757,288 @@ class OpenDFMDialog(QtWidgets.QDialog):
 
     def show_help(self) -> None:
         text = (
-            "1. Enter the PLC IP address and SD log path.\n"
-            "2. Choose all dates, the last N calendar days, or an inclusive range.\n"
-            "3. Click List Files, then select the files to download.\n"
-            "4. Choose an output folder and click Download selected.\n\n"
-            "Files download one at a time. STOP closes the active connection and "
-            "retains the current filename.part file. A later download currently "
-            "restarts that file; byte-offset resume is not yet implemented.\n\n"
-            "The last-N-days filter is anchored to the newest YYYYMMDD folder on "
-            "the PLC, not the computer's current date."
+            "Each tab controls one PLC. Click Add a PLC to open another tab.\n\n"
+            "Different PLCs can scan or download concurrently. OpenDFM blocks a "
+            "second active connection to the same IP address and port.\n\n"
+            "1. Enter the PLC IP address and any valid SD-card path.\n"
+            "2. Choose all dates, last N calendar days, or an inclusive range.\n"
+            "3. Click Scan PLC. Folders appear breadth-first while scanning.\n"
+            "4. Double-click a discovered folder to stop the broad scan and "
+            "continue from that folder.\n"
+            "5. Select files, choose an output folder, and click Download selected.\n\n"
+            "Files within one tab download sequentially. STOP closes that tab's "
+            "active connection and retains the current filename.part file."
         )
         QtWidgets.QMessageBox.information(self, "OpenDFM Help", text)
 
-    def _restore_settings(self) -> None:
-        value = self.settings.value("geometry")
-        if value is not None:
-            self.restoreGeometry(value)
+    def _apply_state(self, state: Dict[str, Any]) -> None:
+        self.hostEdit.setText(str(state.get("host", "")))
+        self.portSpin.setValue(int(state.get("port", 2101)))
+        self.remoteEdit.setText(str(state.get("remote", DEFAULT_REMOTE)))
+        self.outputEdit.setText(str(state.get("output", "")))
+        self.timeoutSpin.setValue(float(state.get("timeout", 5.0)))
+        self.retriesSpin.setValue(int(state.get("retries", 4)))
+        self.daysSpin.setValue(int(state.get("days", 4)))
+        self.overwriteCheck.setChecked(bool(state.get("overwrite", False)))
 
-        self.hostEdit.setText(self.settings.value("host", "192.168.1.61"))
-        self.portSpin.setValue(int(self.settings.value("port", 2101)))
-        self.remoteEdit.setText(self.settings.value("remote", DEFAULT_REMOTE))
-        self.outputEdit.setText(
-            self.settings.value("output", os.fspath(Path.cwd() / "1-secLog"))
-        )
-        self.timeoutSpin.setValue(float(self.settings.value("timeout", 5.0)))
-        self.retriesSpin.setValue(int(self.settings.value("retries", 4)))
-        self.daysSpin.setValue(int(self.settings.value("days", 4)))
-        self.overwriteCheck.setChecked(
-            self.settings.value("overwrite", False, type=bool)
-        )
-
-        mode = self.settings.value("date_mode", "all")
+        mode = str(state.get("date_mode", "all"))
         self.allDatesRadio.setChecked(mode == "all")
         self.lastDaysRadio.setChecked(mode == "days")
         self.dateRangeRadio.setChecked(mode == "range")
 
         start = QtCore.QDate.fromString(
-            self.settings.value("start_date", ""), QtCore.Qt.ISODate,
+            str(state.get("start_date", "")), QtCore.Qt.ISODate,
         )
         end = QtCore.QDate.fromString(
-            self.settings.value("end_date", ""), QtCore.Qt.ISODate,
+            str(state.get("end_date", "")), QtCore.Qt.ISODate,
         )
         if start.isValid():
             self.startDateEdit.setDate(start)
         if end.isValid():
             self.endDateEdit.setDate(end)
 
-    def _save_settings(self) -> None:
+    def state(self) -> Dict[str, Any]:
         mode = "all"
         if self.lastDaysRadio.isChecked():
             mode = "days"
         elif self.dateRangeRadio.isChecked():
             mode = "range"
 
-        self.settings.setValue("geometry", self.saveGeometry())
-        self.settings.setValue("host", self.hostEdit.text().strip())
-        self.settings.setValue("port", self.portSpin.value())
-        self.settings.setValue("remote", self.remoteEdit.text().strip())
-        self.settings.setValue("output", self.outputEdit.text().strip())
-        self.settings.setValue("timeout", self.timeoutSpin.value())
-        self.settings.setValue("retries", self.retriesSpin.value())
-        self.settings.setValue("days", self.daysSpin.value())
-        self.settings.setValue("overwrite", self.overwriteCheck.isChecked())
-        self.settings.setValue("date_mode", mode)
-        self.settings.setValue(
-            "start_date", self.startDateEdit.date().toString(QtCore.Qt.ISODate),
+        return {
+            "host": self.hostEdit.text().strip(),
+            "port": self.portSpin.value(),
+            "remote": self.remoteEdit.text().strip(),
+            "output": self.outputEdit.text().strip(),
+            "timeout": self.timeoutSpin.value(),
+            "retries": self.retriesSpin.value(),
+            "days": self.daysSpin.value(),
+            "overwrite": self.overwriteCheck.isChecked(),
+            "date_mode": mode,
+            "start_date": self.startDateEdit.date().toString(
+                QtCore.Qt.ISODate
+            ),
+            "end_date": self.endDateEdit.date().toString(
+                QtCore.Qt.ISODate
+            ),
+        }
+
+
+class OpenDFMWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        ui_path = Path(__file__).with_name("OpenDFM.ui")
+        uic.loadUi(os.fspath(ui_path), self)
+
+        self.settings = QtCore.QSettings("OpenDFM", "OpenDFM")
+        self.active_endpoints: Dict[Endpoint, PLCPage] = {}
+        self.next_plc_number = 1
+        self.close_when_idle = False
+
+        self.setWindowTitle(f"OpenDFM {VERSION} - PLC SD Log Downloader")
+        self.addPLCButton.clicked.connect(self.add_plc)
+        self.closeAppButton.clicked.connect(self.close)
+        self.tabWidget.tabCloseRequested.connect(self.close_tab)
+        self.tabWidget.currentChanged.connect(self._current_tab_changed)
+        self._restore_pages()
+        self._update_active_label()
+
+    def pages(self) -> List[PLCPage]:
+        return [
+            self.tabWidget.widget(index)
+            for index in range(self.tabWidget.count())
+            if isinstance(self.tabWidget.widget(index), PLCPage)
+        ]
+
+    def add_plc(
+        self, _checked: bool = False,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> PLCPage:
+        number = self.next_plc_number
+        self.next_plc_number += 1
+        page = PLCPage(self, number, state)
+        page.title_changed.connect(
+            lambda _title, item=page: self._refresh_tab_title(item)
         )
-        self.settings.setValue(
-            "end_date", self.endDateEdit.date().toString(QtCore.Qt.ISODate),
+        page.busy_changed.connect(
+            lambda busy, item=page: self._page_busy_changed(item, busy)
+        )
+        page.close_requested.connect(
+            lambda item=page: self.close_page(item)
         )
 
-    def closeEvent(self, event: Any) -> None:
-        if self.thread is not None:
+        index = self.tabWidget.addTab(page, page.display_title)
+        self.tabWidget.setCurrentIndex(index)
+        self._refresh_tab_title(page)
+        return page
+
+    def _refresh_tab_title(self, page: PLCPage) -> None:
+        index = self.tabWidget.indexOf(page)
+        if index < 0:
+            return
+        title = page.display_title
+        if page.is_busy:
+            title += f" [{page.operation}]"
+        self.tabWidget.setTabText(index, title)
+        self.tabWidget.setTabToolTip(index, page.endpoint()[0] or title)
+
+    def claim_endpoint(self, page: PLCPage, endpoint: Endpoint) -> str:
+        owner = self.active_endpoints.get(endpoint)
+        if owner is not None and owner is not page:
+            owner_index = self.tabWidget.indexOf(owner)
+            owner_title = self.tabWidget.tabText(owner_index)
+            host, port = endpoint
+            return (
+                f"{host}:{port} is already active in tab '{owner_title}'.\n\n"
+                "Wait for that operation to finish or press STOP in that tab."
+            )
+        self.active_endpoints[endpoint] = page
+        self._update_active_label()
+        return ""
+
+    def release_endpoint(self, page: PLCPage) -> None:
+        for endpoint, owner in list(self.active_endpoints.items()):
+            if owner is page:
+                del self.active_endpoints[endpoint]
+        self._update_active_label()
+
+    def _update_active_label(self) -> None:
+        count = len(self.active_endpoints)
+        if count == 0:
+            self.activeLabel.setText("No active PLC operations")
+        elif count == 1:
+            self.activeLabel.setText("1 active PLC operation")
+        else:
+            self.activeLabel.setText(f"{count} active PLC operations")
+
+    def _page_busy_changed(self, page: PLCPage, busy: bool) -> None:
+        self._refresh_tab_title(page)
+        self._update_active_label()
+        if not busy and page.close_when_idle:
+            page.close_when_idle = False
+            self._remove_page(page)
+        if self.close_when_idle and not any(item.is_busy for item in self.pages()):
+            self.close_when_idle = False
+            self.close()
+
+    def close_tab(self, index: int) -> None:
+        page = self.tabWidget.widget(index)
+        if isinstance(page, PLCPage):
+            self.close_page(page)
+
+    def close_page(self, page: PLCPage) -> None:
+        if page.is_busy:
             answer = QtWidgets.QMessageBox.question(
-                self, "OpenDFM", "Stop the active operation before closing?",
+                self,
+                "OpenDFM",
+                f"Stop the active operation in {page.display_title} and close the tab?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.Yes,
+                QtWidgets.QMessageBox.No,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+            page.close_when_idle = True
+            page.stop_operation()
+            return
+        self._remove_page(page)
+
+    def _remove_page(self, page: PLCPage) -> None:
+        self.release_endpoint(page)
+        index = self.tabWidget.indexOf(page)
+        if index >= 0:
+            self.tabWidget.removeTab(index)
+        page.deleteLater()
+        if self.tabWidget.count() == 0 and not self.close_when_idle:
+            self.add_plc()
+
+    def _current_tab_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        page = self.tabWidget.widget(index)
+        if isinstance(page, PLCPage):
+            self._refresh_tab_title(page)
+
+    def _restore_pages(self) -> None:
+        geometry = self.settings.value("multi_geometry")
+        if geometry is None:
+            geometry = self.settings.value("geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
+        count = self.settings.beginReadArray("plcs")
+        states: List[Dict[str, Any]] = []
+        for index in range(count):
+            self.settings.setArrayIndex(index)
+            states.append(self._read_state(self.settings))
+        self.settings.endArray()
+
+        if not states:
+            states.append(self._legacy_state())
+
+        for state in states:
+            self.add_plc(state=state)
+
+        current = int(self.settings.value("current_tab", 0))
+        if 0 <= current < self.tabWidget.count():
+            self.tabWidget.setCurrentIndex(current)
+
+    def _legacy_state(self) -> Dict[str, Any]:
+        return {
+            "host": self.settings.value("host", "192.168.1.61"),
+            "port": int(self.settings.value("port", 2101)),
+            "remote": self.settings.value("remote", DEFAULT_REMOTE),
+            "output": self.settings.value(
+                "output", os.fspath(Path.cwd() / "1-secLog")
+            ),
+            "timeout": float(self.settings.value("timeout", 5.0)),
+            "retries": int(self.settings.value("retries", 4)),
+            "days": int(self.settings.value("days", 4)),
+            "overwrite": self.settings.value("overwrite", False, type=bool),
+            "date_mode": self.settings.value("date_mode", "all"),
+            "start_date": self.settings.value("start_date", ""),
+            "end_date": self.settings.value("end_date", ""),
+        }
+
+    @staticmethod
+    def _read_state(settings: QtCore.QSettings) -> Dict[str, Any]:
+        return {
+            "host": settings.value("host", ""),
+            "port": int(settings.value("port", 2101)),
+            "remote": settings.value("remote", DEFAULT_REMOTE),
+            "output": settings.value("output", ""),
+            "timeout": float(settings.value("timeout", 5.0)),
+            "retries": int(settings.value("retries", 4)),
+            "days": int(settings.value("days", 4)),
+            "overwrite": settings.value("overwrite", False, type=bool),
+            "date_mode": settings.value("date_mode", "all"),
+            "start_date": settings.value("start_date", ""),
+            "end_date": settings.value("end_date", ""),
+        }
+
+    def _save_settings(self) -> None:
+        self.settings.setValue("multi_geometry", self.saveGeometry())
+        self.settings.setValue("current_tab", self.tabWidget.currentIndex())
+        self.settings.beginWriteArray("plcs")
+        for index, page in enumerate(self.pages()):
+            self.settings.setArrayIndex(index)
+            for key, value in page.state().items():
+                self.settings.setValue(key, value)
+        self.settings.endArray()
+        self.settings.sync()
+
+    def closeEvent(self, event: Any) -> None:
+        busy_pages = [page for page in self.pages() if page.is_busy]
+        if busy_pages:
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "OpenDFM",
+                f"Stop {len(busy_pages)} active PLC operation(s) and close?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
             )
             if answer == QtWidgets.QMessageBox.Yes:
-                self.stop_operation()
+                self.close_when_idle = True
+                for page in busy_pages:
+                    page.stop_operation()
             event.ignore()
             return
         self._save_settings()
@@ -619,8 +1048,8 @@ class OpenDFMDialog(QtWidgets.QDialog):
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("OpenDFM")
-    dialog = OpenDFMDialog()
-    dialog.show()
+    window = OpenDFMWindow()
+    window.show()
     return app.exec_()
 
 
