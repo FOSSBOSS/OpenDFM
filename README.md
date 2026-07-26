@@ -38,6 +38,14 @@ PLC or modify the PLC program.
 
 ## Requirements
 
+### PC
+
+Verified operational on:
+- Linux
+     Debian, Ubuntu, Mint
+- Windows 10
+
+
 ### PLC
 
 - An IDEC PLC reachable from the computer running OpenDFM.
